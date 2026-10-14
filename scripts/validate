@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# THE gate for claude-workspaces. One validation entry point; git runs it on commit and push.
+# Read its exit code directly: never through a pipe, never chained with `;`.
+set -uo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+fail=0
+step() { printf '\n== %s\n' "$1"; }
+ok()   { printf '   ok: %s\n' "$1"; }
+bad()  { printf '   FAIL: %s\n' "$1"; fail=1; }
+
+step "syntax"
+if sh -n deploy/install.sh && python3 -c 'import ast,sys; [ast.parse(open(f).read(), f) for f in sys.argv[1:]]' claude-workspaces tests/test_launch.py
+then ok "shell and python parse"; else bad "syntax error"; fi
+
+step "launch and create behaviour"
+if out="$(python3 -m unittest discover -s tests 2>&1)"; then ok "$(echo "$out" | grep -E '^Ran ')"; else bad "$(echo "$out" | tail -15)"; fi
+
+step "the installer, end to end, against a fake HOME"
+T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+mkdir -p "$T/home/bin" "$T/inst"
+printf 'old hand-made copy\n' > "$T/home/bin/claude-workspaces"
+echo stale > "$T/inst/removed-long-ago.txt"
+if (HOME="$T/home" HARNESS_INSTALL_DIR="$T/inst" sh deploy/install.sh >"$T/log1" 2>&1); then ok "first install"; else bad "first install: $(tail -5 "$T/log1")"; fi
+[ "$(readlink "$T/home/bin/claude-workspaces")" = "$T/inst/claude-workspaces" ] && ok "~/bin/claude-workspaces points at the install" || bad "claude-workspaces link wrong"
+[ "$(readlink "$T/home/bin/compaction-prompt.md")" = "$T/inst/compaction-prompt.md" ] && ok "compaction prompt linked" || bad "compaction prompt link wrong"
+[ -L "$T/home/bin/cw" ] && ok "cw created when absent" || bad "no ~/bin/cw"
+ls "$T/home/bin/" | grep -q 'claude-workspaces.pre-harness-' && ok "a real file in the way was kept as a backup" || bad "real file overwritten without backup"
+[ ! -e "$T/inst/removed-long-ago.txt" ] && ok "files this version does not ship are pruned" || bad "stale file survived the install"
+inode_before="$(ls -di "$T/inst" | awk '{print $1}')"
+if (HOME="$T/home" HARNESS_INSTALL_DIR="$T/inst" sh deploy/install.sh >"$T/log2" 2>&1); then ok "second install"; else bad "second install: $(tail -5 "$T/log2")"; fi
+[ "$(ls -di "$T/inst" | awk '{print $1}')" = "$inode_before" ] && ok "install dir kept (bind mounts follow it)" || bad "install dir was replaced"
+[ "$(ls "$T/home/bin/" | grep -c pre-harness)" = 1 ] && ok "second install made no new backup" || bad "install is not idempotent"
+if HOME="$T/home" "$T/home/bin/cw" list >/dev/null 2>&1; then ok "cw runs through the link"; else bad "cw does not run through the link"; fi
+
+step "commits and pushes are gated"
+if [ "$(git config core.hooksPath || true)" = ".githooks" ] && [ -x .githooks/pre-commit ] && [ -x .githooks/pre-push ]
+then ok "pre-commit and pre-push run this script"; else bad "hooks not active: git config core.hooksPath .githooks"; fi
+
+printf '\n'; if [ "$fail" -eq 0 ]; then echo "VALIDATE: PASS"; exit 0; else echo "VALIDATE: FAIL"; exit 1; fi

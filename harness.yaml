@@ -1,0 +1,33 @@
+artifact: claude-workspaces
+
+# Every host where cw was hand-installed (a clone in ~/tools/claude-workspaces,
+# linked from ~/bin, 2026-09-02). The hub's install dir is also mounted read-only
+# into a container that launches its workspace with it.
+targets:
+  - host-1
+  - host-2
+  - host-3
+  - host-4
+  # v5 destinations: EC2's second and third home directories, each converging
+  # itself (0-overlord2 HANDOFF, owner decision 2026-10-14).
+  - host-5
+  - host-6
+
+# install.script is a v4 key. A v3 host halts on it rather than skipping it.
+requires_reconciler: 4
+
+install:
+  script: deploy/install.sh
+
+# Nothing to restart: cw is a launcher. Running sessions keep running; the next
+# launch uses the new version.
+restart: none
+
+# Reverting the promoting commit reinstalls the previous version. Outside the
+# install dir the installer owns two symlinks it repoints on every install
+# (~/bin/claude-workspaces, ~/bin/compaction-prompt.md) and creates ~/bin/cw if
+# absent. Removing the artifact leaves them pointing at the last install; the
+# old hand-made clones in ~/tools/claude-workspaces are left in place.
+reverts_cleanly: true
+
+requires_env: []

@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Re-runs the gate on each commit being pushed, in a clean temporary checkout,
+# so a commit made from a partly staged tree cannot reach the bare repo red.
+# Enabled per clone with:  git config core.hooksPath .githooks
+set -uo pipefail
+root="$(git rev-parse --show-toplevel)"
+zero=0000000000000000000000000000000000000000
+status=0
+while read -r local_ref local_sha _remote_ref _remote_sha; do
+  [ "$local_sha" = "$zero" ] && continue          # deleting a remote branch
+  tmp="$(mktemp -d)"
+  if ! git -C "$root" worktree add --detach -q "$tmp/wt" "$local_sha" 2>/dev/null; then
+    echo "pre-push: could not check out $local_sha to validate it. Push blocked." >&2
+    status=1; rm -rf "$tmp"; continue
+  fi
+  "$tmp/wt/scripts/validate" >"$tmp/out" 2>&1
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    echo "pre-push: gate green for $local_ref at $(git -C "$root" rev-parse --short "$local_sha")" >&2
+  else
+    echo "pre-push: scripts/validate FAILED for $local_ref at $local_sha. Push blocked." >&2
+    tail -n 40 "$tmp/out" >&2
+    status=1
+  fi
+  git -C "$root" worktree remove --force "$tmp/wt" >/dev/null 2>&1
+  rm -rf "$tmp"
+done
+exit "$status"

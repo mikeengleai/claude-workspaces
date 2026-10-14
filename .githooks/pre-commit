@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Blocks a commit while the gate is red. Enabled per clone with:
+#     git config core.hooksPath .githooks
+# Runs scripts/validate on the working tree. pre-push re-checks the exact
+# commits being pushed in a clean checkout. Never bypass with --no-verify.
+set -uo pipefail
+root="$(git rev-parse --show-toplevel)"
+out="$(mktemp)"
+"$root/scripts/validate" >"$out" 2>&1
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  echo "pre-commit: scripts/validate FAILED (exit $rc). Commit blocked." >&2
+  tail -n 40 "$out" >&2
+fi
+rm -f "$out"
+exit "$rc"
