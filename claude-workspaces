@@ -3,13 +3,26 @@
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 WORKSPACES_DIR = Path.home() / "workspaces"
 SESSIONS_FILE = Path.home() / ".claude" / "workspace-sessions.json"
+# Workspaces `cw boot` resumes after a reboot. Kept apart from SESSIONS_FILE on purpose:
+# a launch rewrites a sessions entry wholesale and a reset deletes it, and neither
+# should switch autostart off.
+AUTOSTART_FILE = Path.home() / ".claude" / "workspace-autostart.json"
+# Where claude and tmux live on these hosts. The boot hook runs `cw boot` through the
+# user's login shell, but a profile need not set PATH, so `cw boot` also puts whichever
+# of these exist in front of it.
+BOOT_PATH_DIRS = ["~/.local/bin", "~/bin", "~/.npm-global/bin", "/opt/homebrew/bin", "/usr/local/bin"]
+# How long after starting the sessions `cw boot` checks they are still alive. A claude
+# that cannot authenticate or start Remote Control exits within seconds.
+BOOT_SETTLE_SECS = 15
 TMUX_PREFIX = "cw-"  # claude-workspace prefix
 
 # ANSI colors
@@ -30,6 +43,36 @@ def load_sessions():
 
 def save_sessions(sessions):
     SESSIONS_FILE.write_text(json.dumps(sessions, indent=2))
+
+
+def load_autostart():
+    if not AUTOSTART_FILE.exists():
+        return []
+    try:
+        return sorted(json.loads(AUTOSTART_FILE.read_text()).get("autostart", []))
+    except (ValueError, AttributeError) as e:
+        # Loud, not fatal: `cw list` must still work, and boot must say why it did nothing.
+        print(f"  {RED}Unreadable {AUTOSTART_FILE} ({e}); treating as empty.{RESET}", file=sys.stderr)
+        return []
+
+
+def save_autostart(names):
+    AUTOSTART_FILE.parent.mkdir(parents=True, exist_ok=True)
+    AUTOSTART_FILE.write_text(json.dumps({"autostart": sorted(set(names))}, indent=2) + "\n")
+
+
+def set_autostart(name, on):
+    names = set(load_autostart())
+    if (name in names) == on:
+        return
+    (names.add if on else names.discard)(name)
+    save_autostart(names)
+
+
+def rename_autostart(old_name, new_name):
+    names = load_autostart()
+    if old_name in names:
+        save_autostart([new_name if n == old_name else n for n in names])
 
 
 def tmux_session_exists(name):
@@ -81,10 +124,10 @@ def attach(tmux_name):
 
 
 def launch_workspace(name, resume_session_id=None, use_tmux=False, fresh=False, seed_file=None, bg=False,
-                     remote_control=False, detach=False):
+                     remote_control=False, detach=False, continue_if_history=False):
     """Launch (or reattach to) a workspace. Direct (no tmux) by default; pass --tmux to opt in.
 
-    fresh=True bypasses --continue/--resume so the new session has zero prior context.
+    fresh=True bypasses --resume so the new session has zero prior context.
     seed_file (a path) is read and passed as the first user message via the positional prompt arg.
     If seed_file is None and fresh=True, a HANDOFF.md in the workspace dir is auto-detected.
     bg=True launches the session in background mode (agent view) via --bg.
@@ -92,6 +135,8 @@ def launch_workspace(name, resume_session_id=None, use_tmux=False, fresh=False, 
     so it appears in claude.ai/code and the Claude app.
     detach=True (tmux only) starts the session without attaching: for a supervisor with no
     terminal, such as a container's entrypoint. An already-running session is left alone.
+    continue_if_history=True resumes whenever a transcript exists, even with no sessions
+    entry (a reset without relaunch, a rotate or an archive restore drops the entry).
     Returns True when the session is running (or was handed the terminal), False on failure.
     """
     workspace_dir = WORKSPACES_DIR / name
@@ -133,23 +178,23 @@ def launch_workspace(name, resume_session_id=None, use_tmux=False, fresh=False, 
     if remote_control:
         claude_cmd.extend(["--remote-control", name])
 
-    # Only use --continue if this workspace has been launched before AND fresh wasn't requested.
-    # --continue with no prior session causes claude to exit immediately.
+    # Resume only if this workspace has been launched before (or the caller asks to resume
+    # whenever there is history) AND fresh wasn't requested.
     if fresh:
-        # Skip both --resume and --continue. Auto-detect HANDOFF.md if no explicit seed.
+        # Skip --resume. Auto-detect HANDOFF.md if no explicit seed.
         if seed_file is None:
             handoff = workspace_dir / "HANDOFF.md"
             if handoff.exists():
                 seed_file = handoff
     elif resume_session_id:
         claude_cmd.extend(["--resume", resume_session_id])
-    elif sessions.get(name, {}).get("last_launched"):
-        # Only --continue if a session jsonl actually exists in the project dir.
-        # Without one, --continue causes claude to exit immediately.
-        project_dir = workspace_memory_dir(name).parent
-        has_jsonl = project_dir.exists() and any(project_dir.glob("*.jsonl"))
-        if has_jsonl:
-            claude_cmd.extend(["--continue"])
+    elif sessions.get(name, {}).get("last_launched") or continue_if_history:
+        # Resume the newest transcript by id. Not --continue: with no transcript it
+        # exits at once, and in a git worktree it finds none even when they exist
+        # ("No conversation found to continue"), so worktree workspaces never resumed.
+        jsonls = workspace_session_jsonls(name)
+        if jsonls:
+            claude_cmd.extend(["--resume", jsonls[0].stem])
         else:
             print(f"  {DIM}No prior session found — starting fresh{RESET}")
 
@@ -271,6 +316,7 @@ def rename_workspace(old_name, new_name):
         print(f"  {GREEN}Moved Claude project dir{RESET}")
 
     # 4. Update sessions tracking.
+    rename_autostart(old_name, new_name)
     sessions = load_sessions()
     if old_name in sessions:
         entry = sessions.pop(old_name)
@@ -336,6 +382,7 @@ def delete_workspace(name):
         print(f"  {DIM}Removed Claude project dir {project_dir}{RESET}")
 
     # Clean up session entry
+    set_autostart(name, False)
     sessions = load_sessions()
     if name in sessions:
         del sessions[name]
@@ -826,6 +873,7 @@ def shelve_workspace(name):
     if tmux_session_exists(tmux_name):
         subprocess.run(["tmux", "kill-session", "-t", "=" + tmux_name], capture_output=True)
         print(f"  {YELLOW}Stopped running session '{name}'{RESET}")
+    set_autostart(name, False)  # a shelved workspace is hidden; booting it would unhide it
     archive_workspace(name)
 
 
@@ -862,7 +910,7 @@ def archive_workspace(name):
     }
     (archive_root / "rotation-meta.json").write_text(json.dumps(meta, indent=2))
 
-    # Drop sessions[name] so a future launch doesn't pick up stale --continue metadata.
+    # Drop sessions[name] so a future launch doesn't pick up stale resume metadata.
     sessions = load_sessions()
     if name in sessions:
         del sessions[name]
@@ -1730,6 +1778,156 @@ def show_menu(use_tmux=False, bg=False):
                     print(f"  {RED}Unknown option '{choice}'{RESET}")
 
 
+def cmd_autostart(args):
+    """`cw autostart` lists; `cw autostart NAME on|off` sets. Returns an exit code."""
+    if not args:
+        names = load_autostart()
+        if not names:
+            print("  No workspaces are set to autostart.")
+        for n in names:
+            print(f"  {n}")
+        return 0
+    if len(args) != 2 or args[1] not in ("on", "off"):
+        print(f"  {RED}Usage: cw autostart NAME on|off{RESET}")
+        return 2
+    name, on = args[0], args[1] == "on"
+    if on and not (WORKSPACES_DIR / name).exists():
+        print(f"  {RED}Error: workspace '{name}' does not exist{RESET}")
+        return 1
+    set_autostart(name, on)
+    state = f"{GREEN}on{RESET}" if on else "off"
+    print(f"  Autostart for '{name}': {state}")
+    if on and workspace_trusted(name) is False:
+        print(f"  {YELLOW}Not trusted yet: at boot it would wait at claude's trust prompt. "
+              f"{TRUST_HINT.format(name=name)}.{RESET}")
+    return 0
+
+
+def workspace_trusted(name):
+    """Has claude's folder-trust prompt been accepted for this workspace or a folder above
+    it? None when claude's state cannot be read. An untrusted workspace started at boot
+    sits at that prompt, silently, with Remote Control not yet on.
+
+    Trust on a parent reaches down only as far as a git repository's root: seen
+    2026-10-18, a trusted ~/workspaces covered plain folders under it but not the git
+    repos, which each prompted. So the walk upward stops after the first folder with .git.
+    This is observed behaviour, not documented: the check can only warn, never block."""
+    try:
+        projects = json.loads((Path.home() / ".claude.json").read_text()).get("projects", {})
+    except (OSError, ValueError, AttributeError):
+        return None
+    def trusted_up_to_git_root(start):
+        for p in [start, *start.parents]:
+            if projects.get(str(p), {}).get("hasTrustDialogAccepted"):
+                return True
+            if (p / ".git").exists():
+                return False
+        return False
+
+    path = (WORKSPACES_DIR / name).resolve()
+    if trusted_up_to_git_root(path):
+        return True
+    # A git worktree (its .git is a file, "gitdir: <main>/.git/worktrees/<name>") inherits
+    # its main repository's trust: seen 2026-10-18 on two worktrees of a trusted repo.
+    dotgit = path / ".git"
+    if dotgit.is_file():
+        line = dotgit.read_text().strip()
+        if line.startswith("gitdir:") and "/.git/worktrees/" in line:
+            main = Path(line.split(":", 1)[1].strip().split("/.git/worktrees/")[0])
+            return trusted_up_to_git_root(main.resolve())
+    return False
+
+
+TRUST_HINT = "open it once with `cw launch {name}` and accept the folder-trust prompt"
+
+
+def claude_endpoint():
+    """(host, port) claude will talk to: ANTHROPIC_BASE_URL from the environment or
+    ~/.claude/settings.json, else the Anthropic API. Boxes that route claude through a
+    gateway would otherwise wait out the whole timeout probing a host they never use."""
+    url = os.environ.get("ANTHROPIC_BASE_URL")
+    if not url:
+        try:
+            url = json.loads((Path.home() / ".claude" / "settings.json").read_text()) \
+                .get("env", {}).get("ANTHROPIC_BASE_URL")
+        except (OSError, ValueError, AttributeError):
+            url = None
+    u = urlparse(url or "https://api.anthropic.com")
+    return u.hostname or "api.anthropic.com", u.port or (80 if u.scheme == "http" else 443)
+
+
+def wait_for_network(secs):
+    """Poll until claude's endpoint accepts a TCP connection or `secs` pass. True when it did."""
+    host, port = claude_endpoint()
+    deadline = time.time() + secs
+    while True:
+        try:
+            socket.create_connection((host, port), timeout=5).close()
+            return True
+        except OSError:
+            if time.time() >= deadline:
+                return False
+            time.sleep(5)
+
+
+def cmd_boot(args):
+    """Resume every autostart workspace that is not already running: tmux, detached,
+    Remote Control on, continuing its last conversation. Run at login (macOS) or boot
+    (Linux) by the hook the installer writes. Returns 1 if a flagged workspace that
+    exists did not start, or died straight after starting; a flagged workspace that no
+    longer exists is only warned about, so it cannot leave the hook failed forever."""
+    wait = 0
+    if args[:1] == ["--wait-network"] and len(args) == 2 and args[1].isdigit():
+        wait = int(args[1])
+    elif args:
+        print(f"  {RED}Usage: cw boot [--wait-network SECS]{RESET}")
+        return 2
+    path = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    extra = [str(Path(d).expanduser()) for d in BOOT_PATH_DIRS]
+    os.environ["PATH"] = os.pathsep.join([d for d in extra if Path(d).is_dir() and d not in path] + path)
+    # launchd starts jobs with no locale; claude's UI needs UTF-8. The tmux server cw
+    # starts here keeps this environment for every later session on the host.
+    os.environ.setdefault("LANG", "en_US.UTF-8")
+
+    names = load_autostart()
+    print(f"  cw boot {time.strftime('%Y-%m-%d %H:%M:%S')}: {len(names)} flagged")
+    if not names:
+        return 0
+    if wait and not wait_for_network(wait):
+        print(f"  {YELLOW}{'%s:%d' % claude_endpoint()} unreachable after {wait}s; starting anyway.{RESET}")
+    failed, started = [], []
+    for name in names:
+        if not (WORKSPACES_DIR / name).exists():
+            print(f"  {YELLOW}'{name}' is set to autostart but no longer exists; skipped "
+                  f"(cw autostart {name} off){RESET}")
+            continue
+        if workspace_trusted(name) is False:
+            print(f"  {YELLOW}'{name}' is waiting at claude's folder-trust prompt; "
+                  f"{TRUST_HINT.format(name=name)}{RESET}")
+        was_running = tmux_session_exists(TMUX_PREFIX + name)
+        try:
+            ok = launch_workspace(name, use_tmux=True, remote_control=True, detach=True,
+                                  continue_if_history=True)
+        except OSError as e:  # tmux missing, say: the rest must still be tried
+            print(f"  {RED}'{name}': {e}{RESET}")
+            ok = False
+        if not ok:
+            failed.append(name)
+        elif not was_running:
+            started.append(name)
+    if started:
+        time.sleep(BOOT_SETTLE_SECS)
+        for name in started:
+            if not tmux_session_exists(TMUX_PREFIX + name):
+                print(f"  {RED}'{name}' exited within {BOOT_SETTLE_SECS}s of starting "
+                      f"(auth or Remote Control?); try `cw launch {name} --rc`{RESET}")
+                failed.append(name)
+    if failed:
+        print(f"  {RED}Not running: {', '.join(failed)}{RESET}")
+        return 1
+    return 0
+
+
 def print_usage():
     print(f"""
   {BOLD}Claude Code Workspace Manager (cw){RESET}
@@ -1743,7 +1941,7 @@ def print_usage():
     cw launch NAME [flags]            Launch / reattach to a workspace
         flags:
           --session ID      Resume a specific Claude session
-          --fresh           Skip --continue; start a brand-new session
+          --fresh           Do not resume; start a brand-new session
                             (auto-seeds HANDOFF.md if present in workspace dir)
           --seed FILE       Use FILE as the initial-prompt seed (implies --fresh)
           --bg              Launch in background mode (agent view); listed by
@@ -1755,7 +1953,14 @@ def print_usage():
                             appears on claude.ai/code and in the Claude app
           --detach          tmux only: start without attaching (for scripts
                             and containers); a running session is left alone
-    cw list                           List workspaces and status
+    cw list                           List workspaces and status ([autostart] marks flagged ones)
+    cw autostart                      List workspaces resumed at boot
+    cw autostart NAME on|off          Resume NAME at boot: tmux, detached, Remote Control on,
+                                      continuing its last conversation (it sits idle)
+    cw boot [--wait-network SECS]     Start every autostart workspace not already running,
+                                      continuing its last conversation. Run by the hook the
+                                      installer writes (a LaunchAgent at login on macOS, a
+                                      systemd user unit at boot on Linux), via the login shell
     cw create NAME [DESC...]          Create a new workspace (refuses an existing one)
     cw rename OLD NEW                  Rename a workspace (dir, project, sessions)
     cw stop NAME                      Stop a running tmux workspace
@@ -1843,13 +2048,15 @@ def print_usage():
 def cmd_list():
     workspaces = get_workspaces()
     active = get_active_tmux_sessions()
+    flagged = set(load_autostart())
     if not workspaces:
         print("No workspaces found.")
         return
     for ws in workspaces:
         tmux_name = TMUX_PREFIX + ws["name"]
         status = "running" if tmux_name in active else "stopped"
-        print(f"  {ws['name']:<16} [{status}]  {ws['desc'][:50]}")
+        auto = " [autostart]" if ws["name"] in flagged else ""
+        print(f"  {ws['name']:<16} [{status}]{auto}  {ws['desc'][:50]}")
 
 
 def main():
@@ -1929,6 +2136,10 @@ def main():
             sys.exit(1)
     elif args[0] == "list":
         cmd_list()
+    elif args[0] == "autostart":
+        sys.exit(cmd_autostart(args[1:]))
+    elif args[0] == "boot":
+        sys.exit(cmd_boot(args[1:]))
     elif args[0] == "create" and len(args) >= 2:
         name = args[1]
         desc = " ".join(args[2:]) if len(args) > 2 else "General workspace"

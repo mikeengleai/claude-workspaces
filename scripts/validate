@@ -32,6 +32,38 @@ if (HOME="$T/home" HARNESS_INSTALL_DIR="$T/inst" sh deploy/install.sh >"$T/log2"
 [ "$(ls "$T/home/bin/" | grep -c pre-harness)" = 1 ] && ok "second install made no new backup" || bad "install is not idempotent"
 if HOME="$T/home" "$T/home/bin/cw" list >/dev/null 2>&1; then ok "cw runs through the link"; else bad "cw does not run through the link"; fi
 
+step "the boot hook, for each platform, against a fake HOME"
+for plat in Darwin Linux; do
+  H="$T/boot-$plat"; I="$T/inst-$plat"; mkdir -p "$H" "$I"
+  if (HOME="$H" HARNESS_INSTALL_DIR="$I" CW_BOOT_PLATFORM=$plat sh deploy/install.sh >"$T/b1-$plat" 2>&1)
+  then ok "$plat: install"; else bad "$plat: install: $(tail -5 "$T/b1-$plat")"; fi
+  if [ "$plat" = Darwin ]; then
+    F="$H/Library/LaunchAgents/ai.claude-workspaces.boot.plist"
+    [ -f "$F" ] && ok "Darwin: LaunchAgent written" || bad "Darwin: no LaunchAgent"
+    if command -v plutil >/dev/null; then plutil -lint "$F" >/dev/null && ok "Darwin: plist is valid" || bad "Darwin: plist does not lint"
+    else ok "Darwin: plist lint skipped (no plutil on this host)"; fi
+    grep -q '<string>-lc</string><string>exec "$HOME/bin/cw" boot --wait-network 300</string>' "$F" \
+      && ok "Darwin: runs ~/bin/cw boot through the login shell" || bad "Darwin: wrong program"
+    grep -q AbandonProcessGroup "$F" && ok "Darwin: tmux survives the job exiting" || bad "Darwin: launchd would reap tmux"
+  else
+    F="$H/.config/systemd/user/claude-workspaces-boot.service"
+    [ -f "$F" ] && ok "Linux: user unit written" || bad "Linux: no user unit"
+    [ "$(readlink "$H/.config/systemd/user/default.target.wants/claude-workspaces-boot.service")" = ../claude-workspaces-boot.service ] \
+      && ok "Linux: enabled for default.target" || bad "Linux: not enabled"
+    grep -qx 'KillMode=process' "$F" && ok "Linux: stopping the unit keeps the sessions" || bad "Linux: unit would kill tmux"
+    grep -qx "ExecStart=/[^ ]* -lc 'exec %h/bin/cw boot --wait-network 300'" "$F" \
+      && ok "Linux: runs ~/bin/cw boot through the login shell" || bad "Linux: wrong ExecStart: $(grep ^ExecStart "$F")"
+    if command -v systemd-analyze >/dev/null; then
+      systemd-analyze --user verify "$F" >/dev/null 2>&1 && ok "Linux: unit verifies" || bad "Linux: systemd-analyze rejects the unit"
+    else ok "Linux: unit verify skipped (no systemd-analyze on this host)"; fi
+  fi
+  [ -x "$H/bin/cw" ] && ok "$plat: the program the hook runs exists" || bad "$plat: hook points at a missing ~/bin/cw"
+  sum1="$(cksum < "$F")"
+  (HOME="$H" HARNESS_INSTALL_DIR="$I" CW_BOOT_PLATFORM=$plat sh deploy/install.sh >"$T/b2-$plat" 2>&1)
+  if ! grep -q 'boot hook: wrote' "$T/b2-$plat" && [ "$(cksum < "$F")" = "$sum1" ]
+  then ok "$plat: reinstall leaves the hook alone"; else bad "$plat: reinstall rewrote the hook"; fi
+done
+
 step "commits and pushes are gated"
 if [ "$(git config core.hooksPath || true)" = ".githooks" ] && [ -x .githooks/pre-commit ] && [ -x .githooks/pre-push ]
 then ok "pre-commit and pre-push run this script"; else bad "hooks not active: git config core.hooksPath .githooks"; fi

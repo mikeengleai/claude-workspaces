@@ -31,6 +31,42 @@ gated by `scripts/validate`, promoted, then exported here.
 named NAME, without attaching: it appears on claude.ai/code and in the Claude app.
 A session already running is left alone, so a supervisor can call it in a loop.
 
+### Coming back after a reboot: `cw autostart`
+
+```sh
+cw autostart NAME on      # or off
+cw autostart              # which workspaces are flagged
+cw list                   # flagged ones show [autostart]
+```
+
+A flagged workspace is resumed by `cw boot` exactly as `cw launch NAME --rc --detach`
+would: in tmux, Remote Control on, continuing its last conversation. It sits idle at
+the prompt; nothing is sent to it. Running sessions are left alone, so `cw boot` is
+safe to run again. Flags live in `~/.claude/workspace-autostart.json`, apart from the
+session records, so a launch or a `reset` never switches them off; `rename` carries a
+flag over, and `delete` and `shelve` clear it.
+
+A workspace claude has never opened would come up waiting at its folder-trust prompt,
+with Remote Control not yet on. `cw autostart NAME on` and `cw boot` warn about that;
+open it once with `cw launch NAME` and accept the prompt. Trusting a parent folder (such
+as `~/workspaces`) covers every workspace under it.
+
+The installer writes the hook that runs `cw boot --wait-network 300` (it waits up to
+five minutes for claude's endpoint — `ANTHROPIC_BASE_URL` if set, else
+`api.anthropic.com` — then starts anyway) through the account's login shell, so the
+profile's environment reaches the tmux server:
+
+- **macOS:** `~/Library/LaunchAgents/ai.claude-workspaces.boot.plist`, which runs at
+  **login**, since Claude Code's credentials sit in the login keychain. Log:
+  `~/Library/Logs/claude-workspaces-boot.log`.
+- **Linux:** the user unit `claude-workspaces-boot.service`, enabled for
+  `default.target`. It runs at **boot** only if lingering is on
+  (`loginctl enable-linger $USER`); the installer warns when it is off. Log:
+  `journalctl --user -u claude-workspaces-boot`.
+
+The installer writes the hook but never starts it, because starting it would launch
+every flagged workspace at install time. It takes effect at the next login or boot.
+
 ## The compaction prompt
 
 `cw reset` and `cw compact` curate the memory directory using the prompt at
@@ -51,6 +87,8 @@ is *losing* history, not accumulating it.
 |---|---|
 | `cw` | interactive menu |
 | `cw launch <name>` | start or attach a session |
+| `cw autostart <name> on\|off` | resume it at boot (see above) |
+| `cw boot` | start every flagged workspace not already running |
 | `cw reset <name>` | **safe default.** Handoff, compact memory, archive session history. All workspace files stay in place |
 | `cw reset <name> --purge` | as above but deletes session history instead of archiving |
 | `cw reset <name> --full` | delegates to `rotate` |

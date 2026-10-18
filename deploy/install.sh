@@ -38,4 +38,77 @@ mkdir -p "$HOME/bin"
 link "$DEST/claude-workspaces" "$HOME/bin/claude-workspaces"
 link "$DEST/compaction-prompt.md" "$HOME/bin/compaction-prompt.md"
 [ -e "$HOME/bin/cw" ] || [ -L "$HOME/bin/cw" ] || ln -s "$HOME/bin/claude-workspaces" "$HOME/bin/cw"
+# Boot hook: run `cw boot` so workspaces flagged with `cw autostart NAME on` come back
+# after a reboot. Written, never started here: starting it now would launch every
+# flagged workspace at install time. It takes effect at the next login (macOS) or
+# boot (Linux). With nothing flagged, `cw boot` does nothing.
+# Revert note: an older cw left behind by a revert prints its usage for `boot` and
+# exits 0, so a stale hook is harmless.
+put() {  # put FILE: stdin becomes FILE, rewritten only when it changed
+  put_tmp="$1.new.$$"; cat > "$put_tmp"
+  if [ -f "$1" ] && cmp -s "$put_tmp" "$1"; then rm -f "$put_tmp"; else mv "$put_tmp" "$1"; echo "boot hook: wrote $1"; fi
+}
+# The hook runs `cw boot` through the account's login shell, so the profile's PATH
+# and environment reach the tmux server, which every later session on the host
+# inherits. launchd passes no SHELL, so it is looked up here. The PATH below is only
+# the system baseline the shell starts from; cw adds the user's tool dirs itself.
+BOOT_PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+# CW_BOOT_PLATFORM exists for the gate, which installs both hooks on one machine.
+PLATFORM="${CW_BOOT_PLATFORM:-$(uname -s)}"
+case "$PLATFORM" in
+  Darwin) LOGIN_SHELL="$(dscl . -read "/Users/$(id -un)" UserShell 2>/dev/null | awk '{print $2}')" ;;
+  *)      LOGIN_SHELL="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7)" ;;
+esac
+[ -x "${LOGIN_SHELL:-}" ] || LOGIN_SHELL=/bin/sh
+case "$PLATFORM" in
+  Darwin)
+    mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+    put "$HOME/Library/LaunchAgents/ai.claude-workspaces.boot.plist" <<EOF2
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>ai.claude-workspaces.boot</string>
+  <key>ProgramArguments</key>
+  <array><string>$LOGIN_SHELL</string><string>-lc</string><string>exec "\$HOME/bin/cw" boot --wait-network 300</string></array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>$BOOT_PATH</string></dict>
+  <key>RunAtLoad</key><true/>
+  <!-- tmux daemonizes, but launchd would still reap the job's process group on exit. -->
+  <key>AbandonProcessGroup</key><true/>
+  <key>StandardOutPath</key><string>$HOME/Library/Logs/claude-workspaces-boot.log</string>
+  <key>StandardErrorPath</key><string>$HOME/Library/Logs/claude-workspaces-boot.log</string>
+</dict>
+</plist>
+EOF2
+    ;;
+  Linux)
+    U="$HOME/.config/systemd/user"
+    mkdir -p "$U/default.target.wants"
+    put "$U/claude-workspaces-boot.service" <<EOF2
+[Unit]
+Description=Resume cw workspaces flagged with 'cw autostart NAME on'
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The tmux server cw starts lives in this unit's cgroup: stopping or restarting the
+# unit must never take the sessions with it.
+KillMode=process
+Environment=PATH=$BOOT_PATH
+# %h, not \$HOME: systemd expands \$VARS in ExecStart itself, even inside quotes.
+ExecStart=$LOGIN_SHELL -lc 'exec %h/bin/cw boot --wait-network 300'
+
+[Install]
+WantedBy=default.target
+EOF2
+    # What `systemctl --user enable` does, without touching the running user manager.
+    ln -sfn ../claude-workspaces-boot.service "$U/default.target.wants/claude-workspaces-boot.service"
+    if [ "$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null || true)" = "no" ]; then
+      echo "boot hook: WARNING lingering is off for $(id -un): the hook runs at first login, not at boot"
+    fi
+    ;;
+  *) echo "boot hook: skipped on $PLATFORM" ;;
+esac
+
 echo "claude-workspaces: installed ${HARNESS_ARTIFACT_SHA:-unknown}; self-test passed"

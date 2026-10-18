@@ -28,6 +28,17 @@ restart: none
 # (~/bin/claude-workspaces, ~/bin/compaction-prompt.md) and creates ~/bin/cw if
 # absent. Removing the artifact leaves them pointing at the last install; the
 # old hand-made clones in ~/tools/claude-workspaces are left in place.
+#
+# The boot hook (owner decision 2026-10-18: autostart on every host, Remote
+# Control on, resumed sessions idle) is also outside the install dir:
+#   macOS  ~/Library/LaunchAgents/ai.claude-workspaces.boot.plist
+#   Linux  ~/.config/systemd/user/claude-workspaces-boot.service
+#          + default.target.wants/claude-workspaces-boot.service
+# It is written, never started. A revert does NOT remove it: it keeps running
+# at every login (macOS) or boot (Linux), where the older cw prints its usage for
+# `boot` and exits 0. Harmless but not clean; delete those files by hand if a
+# revert is meant to be permanent. reverts_cleanly stays true because nothing
+# the older version runs is affected.
 reverts_cleanly: true
 
 requires_env: []
